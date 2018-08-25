@@ -1,26 +1,25 @@
-from keras import Model
-from keras.applications import InceptionV3
-from keras.models import Sequential
-from keras.layers import Dense, GlobalAveragePooling2D
-import keras
-from keras.utils import np_utils
-from sklearn.datasets import make_blobs, make_circles, make_moons
-from sklearn.model_selection import train_test_split
 import numpy as np
 import os
-import matplotlib.pyplot as plt
-import matplotlib.image as mpimg
 import csv
 from pathlib import Path
 import urllib.request
 from PIL import Image
-import time
-import random
-from keras.callbacks import Callback
+from time import time
+import json
+
+import keras
+from keras import Model
+from keras.applications import VGG19
+from keras.models import Sequential
+from keras.layers import Dense, GlobalAveragePooling2D, Flatten,Dropout
+from keras.utils import np_utils
+from keras.callbacks import Callback, TensorBoard, ModelCheckpoint, EarlyStopping
 from keras.optimizers import SGD
+from datetime import datetime
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '0'
 
+now = datetime.now().strftime("%Y-%m-%d %H:%M")
 
 class WeightsSaver(Callback):
     def __init__(self, model, N):
@@ -115,6 +114,27 @@ class Document:
         self.type = type
 
 
+def memoize(f):
+    memo = {}
+    def helper(x):
+        if x not in memo:            
+            memo[x] = f(x)
+        return memo[x]
+    return helper
+
+def load_document_by_id(path):
+    img = Image.open(path)
+    # arr = np.array(img.getdata()).reshape(img.size[0], img.size[1], 3)
+    arr1 = np.asarray(img)
+    #arr1 = self.__normalized(arr1)
+    
+
+    s = np.shape(arr1)
+    if len(s) == 3 and s[2] == 3:
+        return arr1
+    else:
+        raise 'err'
+
 class DataGenerator(keras.utils.Sequence):
     def __init__(self, name,documents,n_classes, batch_size=32,dim=(299,299), n_channels=1,
                   shuffle=True ):
@@ -131,6 +151,7 @@ class DataGenerator(keras.utils.Sequence):
         self.download_count = 0
         self.discard_count = 0
         self.name = name
+        self.cached_load = load_document_by_id
 
     def __len__(self):
         'Denotes the number of batches per epoch'
@@ -140,7 +161,7 @@ class DataGenerator(keras.utils.Sequence):
         'Generate one batch of data'
         # Generate indexes of the batch
         indexes = self.indexes[index*self.batch_size:(index+1)*self.batch_size]
-
+        
         # Find list of IDs
         document_temp = [self.documents[k] for k in indexes]
 
@@ -155,44 +176,29 @@ class DataGenerator(keras.utils.Sequence):
         if self.shuffle:
             np.random.shuffle(self.indexes)
 
+    def __normalized(self, rgb):
+        rgb  =rgb/1.
+        sum = rgb[:,:,0]+rgb[:,:,1]+rgb[:,:,2]+0.001
+
+        rgb[:,:,0] = rgb[:,:,0]/sum
+        rgb[:,:,1] = rgb[:,:,1]/sum
+        rgb[:,:,2] = rgb[:,:,2]/sum
+        return rgb
+
+    
+
     def __load_document(self, document):
         document_type = document.type.name
         document_id = document.id
         document_dir = f"../documents/{document_type}"
-        my_dir = Path(document_dir)
-        if not my_dir.is_dir():
-            my_dir.mkdir()
-        document_path = f"{document_dir}/{document_id}.jpg"
-        my_file = Path(document_path)
-
         arr = self.empty_image
         try:
-            if not my_file.is_file():
-                document_url = f"https://apis.emaratech.ae/v1/UChannel/services/document/{document_id}"
-                urllib.request.urlretrieve(document_url, document_path)
-                self.download_count = self.download_count+1
-
-                # time.sleep(2)
             document_conv_path = f"{document_dir}/{document_id}_{self.dim[0]}_{self.dim[1]}.jpg"
-            my_conv_file = Path(document_conv_path)
-            if not my_conv_file.is_file():
-                img = Image.open(document_path).resize(self.dim, Image.ANTIALIAS)
-                img.save(document_conv_path, quality=100)
-
-            img = Image.open(document_conv_path)
-            # arr = np.array(img.getdata()).reshape(img.size[0], img.size[1], 3)
-            arr1 = np.asarray(img)
-
-            s = np.shape(arr1)
-            if len(s) == 3 and s[2] == self.n_channels:
-                arr = arr1
-            else:
-                self.discard_count = self.discard_count + 1
-                raise 'err'
-        except:
+            arr = self.cached_load(document_conv_path)
+        except Exception as e:
+            print (str(e))
             self.discard_count = self.discard_count + 1
-            print('\n' + self.name + ' Downloaded ' + str(self.download_count))
-            print('\n' + self.name + ' Discarded ' + str(self.discard_count))
+        #    print('\n' + self.name + ' Discarded ' + str(self.discard_count))
         '''if self.discard_count > 0 and self.discard_count % 5 == 0:
             '''
 
@@ -211,7 +217,8 @@ class DataGenerator(keras.utils.Sequence):
             # Store class
             y[i] = document.type.label
 
-        return X, keras.utils.to_categorical(y, num_classes=self.n_classes)
+        c = keras.utils.to_categorical(y, num_classes=self.n_classes)
+        return X, c
 
 
 def read_csv(file_name):
@@ -226,7 +233,7 @@ def read_csv(file_name):
     return rows
 
 
-def read_document_types(file_name):
+def read_document_types(file_name,included):
     rows = read_csv(file_name)
     dts = []
     unmapped = {}
@@ -239,8 +246,8 @@ def read_document_types(file_name):
             dts.append(DocumentType(name, index))
             index = index+1
 
-    mapped = dict((d.name,d) for d in dts)
-    return mapped, unmapped
+    mapped = dict((d.name,d) for d in dts if d.name in included)
+    return mapped
 
 
 def try_read_document(document_id, document_types):
@@ -249,7 +256,8 @@ def try_read_document(document_id, document_types):
         my_dir = Path(document_dir)
         if not my_dir.is_dir():
             my_dir.mkdir()
-        document_path = f"{document_dir}/{document_id}.jpg"
+
+        document_path = f"{document_dir}/{document_id}_{Image_width}_{Image_height}.jpg"
         my_file = Path(document_path)
         if my_file.is_file():
             return Document(document_id, document_types[document_type_name])
@@ -262,17 +270,27 @@ def read_documents(file_name, document_types):
     return documents
 
 
-document_types, unmapped_document_types = read_document_types('document_type.csv')
-print('Number of categories: ' + str(len(document_types)))
-included = ['Sponsored Photo','Residency']
-doc_type_names = [x for x in document_types if x  in included]
-print(doc_type_names)
-
-for i,dt in enumerate(doc_type_names):
+included = ['Birth Certificate',
+'EIDA Card',
+'Employment Contract',
+'Entry permit visa - Lost letter from police',
+'House Rental contract',
+'Passport',
+'Residency',
+'Salary Certificate-Labour contract-Partnership Contract',
+'Sponsored Photo'
+]
+document_types = read_document_types('document_type.csv',included)
+for i,dt in enumerate(included):
     document_types[dt].label = i
 
+
+print('Number of categories: ' + str(len(included)))
+print(json.dumps(document_types,default=lambda obj: vars(obj)))
+
+
 Image_width, Image_height = 299, 299
-Training_Epochs = 4
+Training_Epochs = 40
 Batch_Size = 32
 Number_FC_Neurons = 1024
 
@@ -282,12 +300,15 @@ Number_FC_Neurons = 1024
 documents = [x for x in read_documents('document.csv',document_types) if x.type.name  in included]
 
 batch_size = Batch_Size
-num_train_samples = ((len(documents)*1) // (10*batch_size)) * batch_size
-num_classes = len(doc_type_names)
-num_validate_samples = (len(documents) // (10*batch_size)) * batch_size 
+num_train_samples = ((len(documents)*70) // (100*batch_size)) * batch_size
+num_classes = len(included)
+num_validate_samples = ((len(documents)*10) // (100*batch_size)) * batch_size 
 num_epoch = Training_Epochs
 
 print("Total training size = ", num_train_samples, ' validate size = ', num_validate_samples)
+for document_type in document_types:
+    print (document_type + ' ' + str(len([x for x in documents[num_validate_samples:num_train_samples+num_validate_samples] if x.type.name == document_type  ])) + 
+   ',' + str(len([x for x in documents[0:num_validate_samples] if x.type.name == document_type  ])))
 
 train_image_gen = DataGenerator('Train', documents[num_validate_samples:num_train_samples+num_validate_samples], num_classes, 
                                batch_size, (Image_width, Image_height), n_channels=3, shuffle=True)
@@ -299,15 +320,17 @@ test_image_gen = DataGenerator('Test', documents[0:num_validate_samples], num_cl
 # Load the Inception V3 model and load it with it's pre-trained weights.  But exclude the final
 #    Fully Connected layer
 
-InceptionV3_base_model = InceptionV3(weights='imagenet', include_top=False) #include_top=False excludes final FC layer
-print('Inception v3 base model without last FC loaded')
+InceptionV3_base_model = VGG19(weights='imagenet', include_top=False, input_shape=(Image_width,Image_height,3)) #include_top=False excludes final FC layer
+print('Vgg19 base model without last FC loaded')
 #print(InceptionV3_base_model.summary())     # display the Inception V3 model hierarchy
 
 x = InceptionV3_base_model.output
-x = GlobalAveragePooling2D()(x)
-x = Dense(Number_FC_Neurons, activation='relu')(x)        # new FC layer, random init
-predictions = Dense(num_classes, activation='softmax')(x)  # new softmax layer
 
+x = Flatten()(x)
+x = Dense(1024, activation="relu")(x)
+x = Dropout(0.5)(x)
+x = Dense(1024, activation="relu")(x)
+predictions = Dense(num_classes, activation="softmax")(x)
 # Define trainable model which links input from the Inception V3 base model to the new classification prediction layers
 model = Model(inputs=InceptionV3_base_model.input, outputs=predictions)
 
@@ -316,25 +339,27 @@ for layer in InceptionV3_base_model.layers:
     layer.trainable = False
 
 # compile the model (should be done *after* setting layers to non-trainable)
-model.compile(optimizer='rmsprop', loss='categorical_crossentropy')
+model.compile(optimizer='rmsprop', loss='categorical_crossentropy', metrics=['accuracy'])
+
+tensorboard = TensorBoard(log_dir="logs/{}".format(now))
 
 # train the model on the new data for a few epochs
-model.fit_generator(    train_image_gen,
+'''model.fit_generator(    train_image_gen,
     epochs=num_epoch // 2,
     steps_per_epoch=num_train_samples // batch_size,
     class_weight='auto',
     validation_data=test_image_gen,
     validation_steps=num_validate_samples // batch_size,
-    callbacks=[WeightsSaver(model, 50)])
-
+    callbacks=[WeightsSaver(model, 200),tensorboard])
+'''
 
 # Option 1: Basic Transfer Learning
 print ('\nPerforming Transfer Learning')
 #   Freeze all layers in the Inception V3 base model
 
-for layer in model.layers[:249]:
+for layer in model.layers[:5]:
    layer.trainable = False
-for layer in model.layers[249:]:
+for layer in model.layers[5:]:
    layer.trainable = True
 
 # print model structure diagram
@@ -342,11 +367,15 @@ for layer in model.layers[249:]:
 
 #   Define model compile for basic Transfer Learning
 model.compile(optimizer=SGD(lr=0.0001, momentum=0.9), loss='categorical_crossentropy', metrics=['accuracy'])
-#model.load_weights('snapshot\\weights3.h5')
+model.load_weights('snapshot/vgg19.final.2018-08-21 19:36.h5')
 
 # Fit the transfer learning model to the data from the generators.
 # By using generators we can ask continue to request sample images and the generators will pull images from
 # the training or validation folders and alter them slightly
+
+checkpoint = ModelCheckpoint(f"snapshot/vgg19.{now}.{num_classes}-"+"{epoch:02d}-{val_loss:.2f}-{val_acc:.2f}.h5", monitor='val_acc', verbose=1, save_best_only=True, save_weights_only=False, mode='auto', period=1)
+early = EarlyStopping(monitor='val_acc', min_delta=0.01, patience=2, verbose=1, mode='auto')
+
 history_transfer_learning = model.fit_generator(
     train_image_gen,
     epochs=num_epoch,
@@ -354,8 +383,8 @@ history_transfer_learning = model.fit_generator(
     class_weight='auto', 
     validation_data=test_image_gen,
     validation_steps=num_validate_samples // batch_size,
-    callbacks=[WeightsSaver(model, 50)]
+    callbacks=[checkpoint, early,tensorboard]
 ) 
 
 # Save transfer learning model
-model.save('inceptionv3-transfer-learning.model')
+model.save(f'snapshot/vgg19.final.{now}.h5')
